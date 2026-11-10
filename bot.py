@@ -1,283 +1,265 @@
-import os
-import re
+   import os
+import glob
 import uuid
 import shutil
 import logging
 import asyncio
+import threading
 from pathlib import Path
-from typing import Optional, Dict
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
-    ApplicationBuilder,
+    Application,
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
-    ContextTypes,
     filters,
+    ContextTypes,
 )
 from telegram.request import HTTPXRequest
 import yt_dlp
+import static_ffmpeg
 
 # ---------------------------------------------------------------------------
-# Logging Configuration
+# ১. রুট ছাড়া সার্ভারে FFmpeg লোড করা (মার্জিং ফেইল হওয়া চিরতরে বন্ধ)
+# ---------------------------------------------------------------------------
+try:
+    static_ffmpeg.add_paths()
+except Exception as e:
+    pass
+
+# ---------------------------------------------------------------------------
+# ২. লগিং কনফিগারেশন
 # ---------------------------------------------------------------------------
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", 
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Constants & Configuration
+# ৩. কনস্ট্যান্ট ও এনভায়রনমেন্ট
 # ---------------------------------------------------------------------------
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-ADMIN_URL = "https://t.me/NahidDevOfficial"
-
-# Standard Telegram Bot API upload size limit: 50 MB
-MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024
-
-# Platform registry with display names and URL matching patterns
-PLATFORMS: Dict[str, Dict[str, str]] = {
-    "tiktok": {
-        "name": "TikTok",
-        "regex": r"(https?://)?(www\.|vm\.|vt\.)?tiktok\.com/.*",
-    },
-    "youtube": {
-        "name": "YouTube",
-        "regex": r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/.*",
-    },
-    "instagram": {
-        "name": "Instagram",
-        "regex": r"(https?://)?(www\.)?instagram\.com/(p|reel|tv)/.*",
-    },
-    "facebook": {
-        "name": "Facebook",
-        "regex": r"(https?://)?(www\.|web\.|m\.)?(facebook\.com|fb\.watch)/.*",
-    },
-    "twitter": {
-        "name": "Twitter / X",
-        "regex": r"(https?://)?(www\.)?(twitter\.com|x\.com)/.+/status/.*",
-    },
-}
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_USERNAME = "NahidDevOfficial"  # আপনার আপডেট করা এডমিন ইউজারনেম
+MAX_FILE_SIZE_BYTES = 48 * 1024 * 1024  # টেলিগ্রাম ফ্রি বটের জন্য ৪৮ এমবি সেফ লিমিট
 
 # ---------------------------------------------------------------------------
-# UI Helpers
+# ৪. রেন্ডার ফ্রি টিয়ার পোর্ট কিপ-অ্যালাইভ সার্ভার (সার্ভার কিল হওয়া আটকাবে)
 # ---------------------------------------------------------------------------
-def build_main_menu() -> InlineKeyboardMarkup:
-    """Builds the main inline keyboard with supported platforms and admin button."""
-    keyboard = [
-        [
-            InlineKeyboardButton("🎵 TikTok", callback_data="platform_tiktok"),
-            InlineKeyboardButton("▶️ YouTube", callback_data="platform_youtube"),
-        ],
-        [
-            InlineKeyboardButton("📸 Instagram", callback_data="platform_instagram"),
-            InlineKeyboardButton("📘 Facebook", callback_data="platform_facebook"),
-        ],
-        [
-            InlineKeyboardButton("🐦 Twitter / X", callback_data="platform_twitter"),
-        ],
-        [
-            InlineKeyboardButton("👨‍💻 অ্যাডমিনের সাথে যোগাযোগ", url=ADMIN_URL),
-        ],
-    ]
-    return InlineKeyboardMarkup(keyboard)
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK - 24/7 Bot Engine Active")
+
+    def log_message(self, format, *args):
+        return
+
+def run_http_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
 
 # ---------------------------------------------------------------------------
-# Bot Handlers
+# ৫. স্টার্ট কমান্ড ও মেনু ডিজাইন
 # ---------------------------------------------------------------------------
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles /start command, clears previous state, and displays the platform menu."""
-    # Reset selected platform state
-    context.user_data.pop("selected_platform", None)
-
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
     welcome_text = (
-        "👋 **Welcome to the Universal Video Downloader Bot!**\n\n"
-        "Please select the platform you want to download video from using the buttons below:"
+        f"👋 Hello **{user.first_name}**!\n\n"
+        "🚀 **Welcome to the Ultimate All-in-One Video Downloader Bot.**\n"
+        "You can download videos effortlessly from **YouTube, TikTok, Facebook, Instagram, Twitter/X**, and more!\n\n"
+        "👇 *Please choose an option below to get started:*"
     )
+    
+    keyboard = [
+        [InlineKeyboardButton("📥 How to Download", callback_data="menu_download")],
+        [InlineKeyboardButton("🌐 Supported Platforms", callback_data="menu_platforms"),
+         InlineKeyboardButton("ℹ️ Help & Guide", callback_data="menu_help")],
+        [InlineKeyboardButton("👨‍💻 Contact Admin", url=f"https://t.me/{ADMIN_USERNAME}")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
     if update.message:
-        await update.message.reply_text(
-            welcome_text,
-            reply_markup=build_main_menu(),
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await update.message.reply_text(welcome_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+    elif update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        await query.edit_message_text(welcome_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
 
-
-async def platform_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Stores the platform selection in user context and prompts for the URL."""
+# ---------------------------------------------------------------------------
+# ৬. বাটন হ্যান্ডলার
+# ---------------------------------------------------------------------------
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     data = query.data
-    if not data or not data.startswith("platform_"):
-        return
+    
+    if data == "menu_download":
+        text = (
+            "📥 **How to Download:**\n\n"
+            "Simply send me a direct video link from any supported platform, and I will instantly process and send the video file to you!"
+        )
+        keyboard = [[InlineKeyboardButton("🔙 Back to Home", callback_data="menu_home")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+        
+    elif data == "menu_platforms":
+        text = (
+            "🌐 **Fully Supported Platforms:**\n\n"
+            "• **YouTube** (Shorts & Standard Videos)\n"
+            "• **TikTok** (Without Watermark)\n"
+            "• **Facebook** (Reels & Public Videos)\n"
+            "• **Instagram** (Reels, Posts & IGTV)\n"
+            "• **Twitter / X** (Clips & Videos)\n\n"
+            "Just paste any link from these platforms in the chat!"
+        )
+        keyboard = [[InlineKeyboardButton("🔙 Back to Home", callback_data="menu_home")]]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+        
+    elif data == "menu_help":
+        text = (
+            "ℹ️ **Help & Information:**\n\n"
+            "1. Send a valid video URL.\n"
+            "2. Wait a few seconds while the engine extracts the media.\n"
+            "3. Receive your video file directly in chat.\n\n"
+            "If you encounter any issues or need custom support, click below to contact the admin."
+        )
+        keyboard = [
+            [InlineKeyboardButton("👨‍💻 Contact Admin", url=f"https://t.me/{ADMIN_USERNAME}")],
+            [InlineKeyboardButton("🔙 Back to Home", callback_data="menu_home")]
+        ]
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+        
+    elif data == "menu_home":
+        await start(update, context)
 
-    platform_key = data.replace("platform_", "")
-    platform_info = PLATFORMS.get(platform_key)
-
-    if not platform_info:
-        await query.edit_message_text("❌ Unknown platform selected. Please try /start again.")
-        return
-
-    # Store user's selected platform
-    context.user_data["selected_platform"] = platform_key
-
-    await query.edit_message_text(
-        text=(
-            f"✅ **You selected {platform_info['name']}.**\n\n"
-            f"Now please send the correct {platform_info['name']} video link.\n\n"
-            "_Send /start anytime if you want to switch platforms._"
-        ),
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-def run_ytdlp_download(url: str, output_template: str) -> Optional[dict]:
-    """Blocking worker function executed in an executor thread to run yt-dlp."""
+# ---------------------------------------------------------------------------
+# ৭. কোর yt-dlp ডাউনলোড ইঞ্জিন (Worker Thread)
+# ---------------------------------------------------------------------------
+def run_ytdlp(url: str, output_path: str):
     ydl_opts = {
-        # Select best mp4 video + best audio, or fallback to single best stream under standard sizes
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "outtmpl": output_template,
-        "merge_output_format": "mp4",
-        "quiet": True,
-        "no_warnings": True,
-        "max_filesize": MAX_FILE_SIZE_BYTES,
-        "socket_timeout": 30,
-        "noplaylist": True,
+        'format': 'bestvideo[filesize<42M][ext=mp4]+bestaudio[ext=m4a]/best[filesize<48M][ext=mp4]/best[filesize<48M]/best',
+        'outtmpl': output_path,
+        'merge_output_format': 'mp4',
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': True,
+        'socket_timeout': 30,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
+        },
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'ios', 'web']
+            }
+        }
     }
-
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info_dict = ydl.extract_info(url, download=True)
-        return ydl.sanitize_info(info_dict)
+        info = ydl.extract_info(url, download=True)
+        return ydl.sanitize_info(info)
 
-
-async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Validates URL according to current selection, downloads, and sends video."""
+# ---------------------------------------------------------------------------
+# ৮. নন-ব্লকিং মেসেজ হ্যান্ডলার
+# ---------------------------------------------------------------------------
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not message or not message.text:
         return
 
-    user_text = message.text.strip()
-    selected_platform_key = context.user_data.get("selected_platform")
-
-    # 1. State Check: User must select a platform first
-    if not selected_platform_key or selected_platform_key not in PLATFORMS:
-        await message.reply_text(
-            "⚠️ Please select a platform first by clicking one of the buttons below:",
-            reply_markup=build_main_menu(),
-        )
+    url = message.text.strip()
+    if not url.startswith("http://") and not url.startswith("https://"):
+        await message.reply_text("⚠️ Please send a valid video URL starting with `http://` or `https://`", parse_mode=ParseMode.MARKDOWN)
         return
 
-    platform_info = PLATFORMS[selected_platform_key]
-    platform_name = platform_info["name"]
-    pattern = platform_info["regex"]
+    status_message = await message.reply_text("⏳ *Processing your link... Fetching video from platform.*", parse_mode=ParseMode.MARKDOWN)
 
-    # 2. Domain & Platform Validation
-    if not re.search(pattern, user_text, re.IGNORECASE):
-        await message.reply_text(
-            f"⚠️ **Invalid link for {platform_name}!**\n\n"
-            f"You previously selected **{platform_name}**, but the link you provided does not match.\n"
-            f"Please send a valid **{platform_name}** link, or click /start to pick another platform.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-    # 3. Preparation for Processing & Server Hygiene
-    status_msg = await message.reply_text("⏳ Processing your link, please wait...")
     job_id = uuid.uuid4().hex
     temp_dir = Path(f"/tmp/ytdl_{job_id}")
-    output_template = str(temp_dir / "%(title).50s [%(id)s].%(ext)s")
+    output_template = str(temp_dir / "%(id)s.%(ext)s")
 
     try:
         temp_dir.mkdir(parents=True, exist_ok=True)
         await message.chat.send_action(action=ChatAction.UPLOAD_VIDEO)
 
-        # Execute yt-dlp safely off the event loop
         loop = asyncio.get_running_loop()
-        info = await loop.run_in_executor(None, run_ytdlp_download, user_text, output_template)
+        info = await loop.run_in_executor(None, run_ytdlp, url, output_template)
 
-        # Locate downloaded output file
-        downloaded_files = list(temp_dir.glob("*.mp4")) or list(temp_dir.glob("*.*"))
+        downloaded_files = glob.glob(f"{temp_dir}/*")
         if not downloaded_files:
-            raise FileNotFoundError("Video file could not be generated or found on the server.")
+            raise FileNotFoundError("Video download failed on the server.")
 
         video_path = downloaded_files[0]
-        file_size = video_path.stat().st_size
+        file_size = os.path.getsize(video_path)
 
         if file_size > MAX_FILE_SIZE_BYTES:
-            await status_msg.edit_text(
-                "❌ **File too large:** The requested video exceeds Telegram's 50MB bot upload limit."
-            )
+            await status_message.edit_text("❌ *Error:* The video file size exceeds Telegram's 50MB free bot limit.", parse_mode=ParseMode.MARKDOWN)
             return
 
-        title = info.get("title", "Downloaded Video") if info else "Downloaded Video"
-        await status_msg.edit_text("📤 Uploading video to Telegram...")
+        title = info.get("title", "Video") if info else "Video"
+        clean_title = "".join(ch for ch in title if ch.isalnum() or ch in " -_()[]")[:50]
+
+        await status_message.edit_text("📤 *Uploading video to Telegram...*", parse_mode=ParseMode.MARKDOWN)
 
         with open(video_path, "rb") as video_file:
             await message.reply_video(
                 video=video_file,
-                caption=f"🎬 **{title}**\n\nDownloaded via @{context.bot.username}",
+                caption=f"🎬 *{clean_title}*\n\n✅ *Downloaded successfully via All-in-One Bot!*",
                 parse_mode=ParseMode.MARKDOWN,
                 supports_streaming=True,
+                read_timeout=300,
+                write_timeout=300
             )
+            
+        await status_message.delete()
 
-        # Clean up the initial status update
-        await status_msg.delete()
-
-    except yt_dlp.utils.DownloadError as err:
-        logger.warning("yt-dlp download error: %s", str(err))
-        await status_msg.edit_text(
-            "❌ **Download failed:** The video may be private, age-restricted, removed, or geo-blocked."
-        )
-    except Exception as exc:
-        logger.error("Unexpected error handling video: %s", str(exc), exc_info=True)
-        await status_msg.edit_text(
-            "❌ An unexpected error occurred while processing your request. Please try again later."
-        )
+    except yt_dlp.utils.DownloadError as dl_err:
+        err_text = str(dl_err).lower()
+        logger.error(f"yt-dlp Download Error: {dl_err}")
+        if "confirm you're not a bot" in err_text or "sign in" in err_text:
+            await status_message.edit_text("❌ Cloud IP restricted by platform. Try a different platform or video.")
+        elif "private" in err_text:
+            await status_message.edit_text("❌ This video is private or unavailable.")
+        else:
+            await status_message.edit_text("❌ Failed to process this video link. Please verify the URL.")
+            
+    except Exception as e:
+        logger.error(f"Error handling video: {e}", exc_info=True)
+        await status_message.edit_text("❌ An unexpected error occurred while downloading.")
+        
     finally:
-        # Strict server hygiene: wipe the temporary folder and its contents
         if temp_dir.exists():
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-
 # ---------------------------------------------------------------------------
-# Application Initialization
+# ৯. মেইন ফাংশন
 # ---------------------------------------------------------------------------
-def main() -> None:
-    """Bootstraps and starts the polling service."""
+def main():
     if not BOT_TOKEN:
-        logger.critical("BOT_TOKEN environment variable is missing. Exiting.")
-        raise ValueError("BOT_TOKEN environment variable not set.")
+        logger.critical("BOT_TOKEN environment variable not set!")
+        return
 
-    # Extended timeout configuration to avoid dropped polling sessions on cloud providers
+    threading.Thread(target=run_http_server, daemon=True).start()
+
     custom_request = HTTPXRequest(
         connect_timeout=60.0,
-        read_timeout=60.0,
-        write_timeout=60.0,
-        pool_timeout=60.0,
+        read_timeout=300.0,
+        write_timeout=300.0,
+        pool_timeout=60.0
     )
 
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .request(custom_request)
-        .build()
-    )
+    application = Application.builder().token(BOT_TOKEN).request(custom_request).build()
 
-    # Handlers
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CallbackQueryHandler(platform_callback, pattern=r"^platform_"))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_url))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    logger.info("Bot successfully initialized. Starting long-polling...")
-    app.run_polling(drop_pending_updates=True)
-
+    logger.info("Bot engine is fully initialized and listening...")
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
